@@ -1,53 +1,44 @@
 #!/usr/bin/env python3
 """
-Delete Migrated Data Script - MariaDB Target Database Cleanup
-
-⚠️  DANGER: This script DELETES data from the target database!
+Database Cleanup Script - Drop Migrated Databases from Target
 
 Purpose:
-- Read table structure from SOURCE database
-- DELETE matching data from TARGET database
-- Use for cleanup, testing, or reverting migrations
+  Drop databases from TARGET that exist in SOURCE.
+  Used for cleanup, testing, or reverting migrations.
 
 Safety Features:
-- 🔴 Multi-step confirmation (must type 'DELETE DATA')
-- 🧪 Dry-run mode (--dry-run)
-- 📦 Automatic backup before deletion (--backup)
-- 📝 Deletion logging for audit trail
-- 🎯 Filter by customer_id (prevents deleting all data)
-- ⚠️  Shows deletion plan before executing
+  - Multi-step confirmation (must type 'DROP DATABASES')
+  - Dry-run mode (--dry-run)
+  - Optional backup before dropping (--backup)
+  - Shows exactly what will be dropped before executing
 
-Usage Examples:
-  # Preview what would be deleted (safe)
+Usage:
+  # Preview what would be dropped (safe)
   python delete_migrated_data.py --dry-run
 
-  # Delete with backup (recommended)
+  # Drop with backup (recommended)
   python delete_migrated_data.py --backup
 
-  # Delete without backup (dangerous!)
-  python delete_migrated_data.py
+  # Drop specific databases only
+  python delete_migrated_data.py --databases STARFOX,ONBOARDING
 
-  # Delete specific tables only
-  python delete_migrated_data.py --tables users,orders
-
-  # Delete from specific databases only
-  python delete_migrated_data.py --databases STARFOX,AUTH_PROXY
+  # Drop all matching databases
+  python delete_migrated_data.py --all
 """
 
 import pymysql
 import os
 from dotenv import load_dotenv
 import sys
-from typing import List, Dict, Any, Optional
+from typing import List, Dict
 import argparse
 from datetime import datetime
-import json
 import subprocess
 
 # Load environment variables
 load_dotenv()
 
-# Source database configuration (READ - for table discovery)
+# Source database configuration (READ - to know which DBs to drop)
 READ_CONFIG = {
     'host': os.getenv('READ_DB_HOST'),
     'port': int(os.getenv('READ_DB_PORT', 3306)),
@@ -57,7 +48,7 @@ READ_CONFIG = {
     'cursorclass': pymysql.cursors.DictCursor
 }
 
-# Target database configuration (WRITE - where data will be DELETED!)
+# Target database configuration (WRITE - where DBs will be DROPPED!)
 WRITE_CONFIG = {
     'host': os.getenv('WRITE_DB_HOST'),
     'port': int(os.getenv('WRITE_DB_PORT', 3306)),
@@ -67,6 +58,8 @@ WRITE_CONFIG = {
     'cursorclass': pymysql.cursors.DictCursor
 }
 
+SYSTEM_DATABASES = ['information_schema', 'performance_schema', 'mysql', 'sys']
+
 
 def validate_config():
     """Validate required environment variables."""
@@ -74,486 +67,304 @@ def validate_config():
         'READ_DB_HOST', 'READ_DB_USER', 'READ_DB_PASSWORD',
         'WRITE_DB_HOST', 'WRITE_DB_USER', 'WRITE_DB_PASSWORD'
     ]
-    
+
     missing = [var for var in required_vars if not os.getenv(var)]
-    
+
     if missing:
-        print(f"❌ Error: Missing required environment variables: {', '.join(missing)}")
+        print(f"Error: Missing required environment variables: {', '.join(missing)}")
         print("Please update your .env file with the required credentials.")
         sys.exit(1)
 
 
-def get_all_databases(connection) -> List[str]:
-    """Get all databases from source (excluding system databases)."""
+def get_databases(connection) -> List[str]:
+    """Get all non-system databases."""
     with connection.cursor() as cursor:
         cursor.execute("SHOW DATABASES")
-        databases = [row['Database'] for row in cursor.fetchall() 
-                    if row['Database'] not in ['information_schema', 'performance_schema', 
-                                               'mysql', 'sys']]
+        databases = [row['Database'] for row in cursor.fetchall()
+                    if row['Database'] not in SYSTEM_DATABASES]
     return databases
 
 
-def get_all_tables(connection, database: str) -> List[str]:
-    """Get all tables from a database."""
-    with connection.cursor() as cursor:
-        cursor.execute(f"SHOW TABLES FROM `{database}`")
-        result = cursor.fetchall()
-        if result:
-            # Get the first column value (table name)
-            tables = [list(row.values())[0] for row in result]
-            return tables
-        return []
-
-
-def has_customer_id_column(connection, database: str, table: str) -> bool:
-    """Check if table has customer_id column."""
+def get_database_info(connection, db_name: str) -> Dict:
+    """Get table count and approximate size for a database."""
+    info = {'tables': 0, 'size_mb': 0}
     try:
         with connection.cursor() as cursor:
-            cursor.execute(f"DESCRIBE `{database}`.`{table}`")
-            columns = [row['Field'].lower() for row in cursor.fetchall()]
-            return 'customer_id' in columns
-    except:
-        return False
-
-
-def count_rows(connection, database: str, table: str, customer_ids: Optional[List[int]] = None) -> int:
-    """Count rows in table (optionally filtered by customer_id)."""
-    try:
-        with connection.cursor() as cursor:
-            if customer_ids:
-                placeholders = ','.join(['%s'] * len(customer_ids))
-                query = f"SELECT COUNT(*) as cnt FROM `{database}`.`{table}` WHERE customer_id IN ({placeholders})"
-                cursor.execute(query, customer_ids)
-            else:
-                query = f"SELECT COUNT(*) as cnt FROM `{database}`.`{table}`"
-                cursor.execute(query)
-            
+            # Get table count
+            cursor.execute(f"SELECT COUNT(*) as cnt FROM information_schema.tables WHERE table_schema = %s", (db_name,))
             result = cursor.fetchone()
-            return result['cnt'] if result else 0
+            info['tables'] = result['cnt'] if result else 0
+
+            # Get approximate size
+            cursor.execute("""
+                SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024, 2) as size_mb
+                FROM information_schema.tables
+                WHERE table_schema = %s
+            """, (db_name,))
+            result = cursor.fetchone()
+            info['size_mb'] = result['size_mb'] if result and result['size_mb'] else 0
     except Exception as e:
-        print(f"    ⚠️  Could not count rows in {database}.{table}: {e}")
-        return 0
+        print(f"  Warning: Could not get info for {db_name}: {e}")
+    return info
 
 
-def analyze_deletion_scope(source_conn, target_conn, databases: List[str], 
-                           customer_ids: Optional[List[int]] = None,
-                           specific_tables: Optional[List[str]] = None) -> Dict[str, Any]:
-    """
-    Analyze what would be deleted.
-    
-    Args:
-        source_conn: Source database connection (for table discovery)
-        target_conn: Target database connection (for row counting)
-        databases: List of databases to analyze
-        customer_ids: Optional customer IDs to filter
-        specific_tables: Optional list of specific tables to delete
-        
-    Returns:
-        Analysis dict with deletion plan
-    """
-    analysis = {
-        'databases': [],
-        'total_tables': 0,
-        'total_rows': 0
-    }
-    
-    for db_name in databases:
-        db_analysis = {
+def analyze_drop_scope(source_conn, target_conn, databases: List[str]) -> Dict:
+    """Analyze what databases exist in both source and target."""
+    source_dbs = set(get_databases(source_conn))
+    target_dbs = set(get_databases(target_conn))
+
+    # Filter to requested databases
+    if databases:
+        requested = set(databases)
+        # Only include databases that exist in both source and target
+        to_drop = requested & source_dbs & target_dbs
+        not_in_source = requested - source_dbs
+        not_in_target = requested - target_dbs
+    else:
+        to_drop = source_dbs & target_dbs
+        not_in_source = set()
+        not_in_target = set()
+
+    # Get info for each database to drop
+    drop_info = []
+    for db_name in sorted(to_drop):
+        info = get_database_info(target_conn, db_name)
+        drop_info.append({
             'name': db_name,
-            'tables': []
-        }
-        
-        try:
-            # Get tables from source
-            tables = get_all_tables(source_conn, db_name)
-            
-            # Filter by specific tables if provided
-            if specific_tables:
-                tables = [t for t in tables if t in specific_tables]
-            
-            for table in tables:
-                has_customer_id = has_customer_id_column(target_conn, db_name, table)
-                
-                # Count rows in TARGET
-                if has_customer_id and customer_ids:
-                    row_count = count_rows(target_conn, db_name, table, customer_ids)
-                    filter_used = f"customer_id IN ({','.join(map(str, customer_ids))})"
-                else:
-                    row_count = count_rows(target_conn, db_name, table)
-                    filter_used = "ALL ROWS (no customer_id filter)"
-                
-                if row_count > 0:
-                    table_info = {
-                        'name': table,
-                        'row_count': row_count,
-                        'has_customer_id': has_customer_id,
-                        'filter_used': filter_used
-                    }
-                    
-                    db_analysis['tables'].append(table_info)
-                    analysis['total_rows'] += row_count
-            
-            if db_analysis['tables']:
-                db_analysis['table_count'] = len(db_analysis['tables'])
-                analysis['databases'].append(db_analysis)
-                analysis['total_tables'] += db_analysis['table_count']
-        
-        except Exception as e:
-            print(f"⚠️  Error analyzing {db_name}: {e}")
-    
-    return analysis
+            'tables': info['tables'],
+            'size_mb': info['size_mb']
+        })
+
+    return {
+        'databases': drop_info,
+        'total_databases': len(drop_info),
+        'total_tables': sum(d['tables'] for d in drop_info),
+        'total_size_mb': sum(d['size_mb'] for d in drop_info),
+        'not_in_source': sorted(not_in_source),
+        'not_in_target': sorted(not_in_target)
+    }
 
 
-def show_deletion_plan(analysis: Dict[str, Any]):
-    """Display deletion plan for review."""
-    print("\n" + "="*80)
-    print("🔴 DELETION PLAN REVIEW")
-    print("="*80)
-    print("\n⚠️  WARNING: The following data will be PERMANENTLY DELETED from TARGET database!")
-    print(f"   Target: {WRITE_CONFIG['host']}:{WRITE_CONFIG['port']}\n")
-    
+def show_drop_plan(analysis: Dict):
+    """Display what will be dropped."""
+    print("\n" + "="*70)
+    print("DROP PLAN REVIEW")
+    print("="*70)
+    print(f"\nTarget: {WRITE_CONFIG['host']}:{WRITE_CONFIG['port']}")
+    print("\nThe following databases will be DROPPED:\n")
+
+    print(f"{'Database':<30} {'Tables':<10} {'Size (MB)':<15}")
+    print("-"*55)
+
     for db in analysis['databases']:
-        print(f"📁 Database: {db['name']} ({db['table_count']} tables)")
-        
-        for table in db['tables']:
-            print(f"   • {table['name']:<30} {table['row_count']:>8,} rows")
-            print(f"     Filter: {table['filter_used']}")
-    
-    print("\n" + "="*80)
-    print("📊 DELETION SUMMARY")
-    print("="*80)
-    print(f"  Total Databases: {len(analysis['databases'])}")
-    print(f"  Total Tables: {analysis['total_tables']}")
-    print(f"  Total Rows to Delete: {analysis['total_rows']:,}")
-    print("="*80)
+        print(f"{db['name']:<30} {db['tables']:<10} {db['size_mb']:<15.2f}")
+
+    print("-"*55)
+    print(f"{'TOTAL':<30} {analysis['total_tables']:<10} {analysis['total_size_mb']:<15.2f}")
+
+    if analysis['not_in_source']:
+        print(f"\nSkipped (not in source): {', '.join(analysis['not_in_source'])}")
+    if analysis['not_in_target']:
+        print(f"Skipped (not in target): {', '.join(analysis['not_in_target'])}")
+
+    print("="*70)
 
 
-def get_deletion_confirmation(analysis: Dict[str, Any]) -> bool:
-    """Multi-step confirmation before deletion."""
-    print("\n🔴 DANGER: This will PERMANENTLY DELETE data from the target database!")
-    print("🔴 Make sure you have a backup before proceeding!")
-    
-    # Step 1: Initial warning
-    print("\n" + "─"*80)
-    response = input("Do you understand this will DELETE data? (yes/no): ").strip().lower()
-    if response not in ['yes', 'y']:
-        print("❌ Deletion cancelled.")
+def get_confirmation(analysis: Dict) -> bool:
+    """Multi-step confirmation before dropping."""
+    print("\n" + "!"*70)
+    print("WARNING: This will PERMANENTLY DROP databases from the target server!")
+    print("!"*70)
+
+    # Show plan
+    show_drop_plan(analysis)
+
+    # Step 1: Confirm understanding
+    print("\nStep 1/2: Do you understand this will DROP these databases?")
+    response = input("Type 'yes' to continue: ").strip().lower()
+    if response != 'yes':
+        print("Cancelled.")
         return False
-    
-    # Step 2: Show plan
-    show_deletion_plan(analysis)
-    
-    # Step 3: Confirm after seeing plan
-    print("\n" + "─"*80)
-    print(f"⚠️  You are about to delete {analysis['total_rows']:,} rows from {analysis['total_tables']} tables!")
-    response = input("\nProceed with deletion? (yes/no): ").strip().lower()
-    if response not in ['yes', 'y']:
-        print("❌ Deletion cancelled.")
-        return False
-    
-    # Step 4: Final confirmation with typing
-    print("\n" + "─"*80)
-    print("🔴 FINAL CONFIRMATION REQUIRED")
-    print(f"Type 'DELETE DATA' to confirm deletion of {analysis['total_rows']:,} rows:")
+
+    # Step 2: Final confirmation
+    print(f"\nStep 2/2: Type 'DROP DATABASES' to confirm dropping {analysis['total_databases']} database(s):")
     response = input("> ").strip()
-    
-    if response != 'DELETE DATA':
-        print("❌ Deletion cancelled. (You must type exactly: DELETE DATA)")
+    if response != 'DROP DATABASES':
+        print("Cancelled. You must type exactly: DROP DATABASES")
         return False
-    
-    print("\n✅ Confirmation received. Starting deletion...")
+
     return True
 
 
-def backup_before_deletion(databases: List[str], backup_dir: str = 'deletion_backups') -> str:
-    """Create backup of target before deletion."""
+def backup_databases(databases: List[str], backup_dir: str = 'backups') -> str:
+    """Create backup before dropping."""
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    backup_path = os.path.join(backup_dir, f'backup_before_deletion_{timestamp}')
+    backup_path = os.path.join(backup_dir, f'backup_{timestamp}')
     os.makedirs(backup_path, exist_ok=True)
-    
-    print("\n📦 Creating backup of TARGET database before deletion...")
-    print(f"   Location: {backup_path}")
-    
+
+    print(f"\nCreating backup in: {backup_path}")
+
     for db_name in databases:
         backup_file = os.path.join(backup_path, f'{db_name}.sql')
-        
-        print(f"   🔄 Backing up: {db_name}...", end='', flush=True)
-        
+        print(f"  Backing up {db_name}...", end='', flush=True)
+
         cmd = [
             'mysqldump',
             '-h', WRITE_CONFIG['host'],
             '-P', str(WRITE_CONFIG['port']),
             '-u', WRITE_CONFIG['user'],
+            f'-p{WRITE_CONFIG["password"]}',
             '--databases', db_name
         ]
-        
-        if WRITE_CONFIG.get('password'):
-            cmd.insert(1, f'-p{WRITE_CONFIG["password"]}')
-        
+
         try:
             with open(backup_file, 'w') as f:
-                result = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE, 
-                                       text=True, timeout=300)
-            
+                result = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE,
+                                       text=True, timeout=600)
+
             if result.returncode == 0:
                 size = os.path.getsize(backup_file)
-                print(f" ✓ ({size / 1024 / 1024:.1f} MB)")
+                print(f" Done ({size / 1024 / 1024:.1f} MB)")
             else:
-                print(f" ⚠️  Warning: {result.stderr}")
-        
+                print(f" Warning: {result.stderr[:100]}")
         except Exception as e:
-            print(f" ❌ Error: {e}")
-    
-    print(f"\n✅ Backup completed: {backup_path}")
+            print(f" Error: {e}")
+
+    print(f"Backup completed: {backup_path}\n")
     return backup_path
 
 
-def execute_deletion(target_conn, analysis: Dict[str, Any], log_file: str):
-    """
-    Execute deletion on target database.
-    
-    Args:
-        target_conn: Target database connection
-        analysis: Deletion analysis from analyze_deletion_scope()
-        log_file: File to log deletions
-    """
-    deletion_log = {
-        'timestamp': datetime.now().isoformat(),
-        'target_host': WRITE_CONFIG['host'],
-        'target_port': WRITE_CONFIG['port'],
-        'deletions': []
-    }
-    
-    total_deleted = 0
-    
-    print("\n🗑️  Starting deletion process...")
-    
-    # Disable FK checks temporarily
-    with target_conn.cursor() as cursor:
-        cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
-        target_conn.commit()
-    
-    try:
-        for db in analysis['databases']:
-            print(f"\n📁 Database: {db['name']}")
-            
-            for table_info in db['tables']:
-                table = table_info['name']
-                print(f"  🗑️  Deleting from: {table}...", end='', flush=True)
-                
-                try:
-                    with target_conn.cursor() as cursor:
-                        # Build DELETE query
-                        if table_info['has_customer_id'] and 'customer_id IN' in table_info['filter_used']:
-                            # Extract customer IDs from filter string
-                            import re
-                            match = re.search(r'customer_id IN \(([\d,]+)\)', table_info['filter_used'])
-                            if match:
-                                customer_ids = [int(x) for x in match.group(1).split(',')]
-                                placeholders = ','.join(['%s'] * len(customer_ids))
-                                query = f"DELETE FROM `{db['name']}`.`{table}` WHERE customer_id IN ({placeholders})"
-                                cursor.execute(query, customer_ids)
-                        else:
-                            # Delete all rows
-                            query = f"DELETE FROM `{db['name']}`.`{table}`"
-                            cursor.execute(query)
-                        
-                        deleted_count = cursor.rowcount
-                        target_conn.commit()
-                        
-                        print(f" ✓ Deleted {deleted_count:,} rows")
-                        total_deleted += deleted_count
-                        
-                        # Log deletion
-                        deletion_log['deletions'].append({
-                            'database': db['name'],
-                            'table': table,
-                            'rows_deleted': deleted_count,
-                            'filter': table_info['filter_used']
-                        })
-                
-                except Exception as e:
-                    print(f" ❌ Error: {e}")
-                    deletion_log['deletions'].append({
-                        'database': db['name'],
-                        'table': table,
-                        'error': str(e)
-                    })
-    
-    finally:
-        # Re-enable FK checks
-        with target_conn.cursor() as cursor:
-            cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
-            target_conn.commit()
-    
-    # Save log
-    with open(log_file, 'w') as f:
-        json.dump(deletion_log, f, indent=2)
-    
-    print(f"\n✅ Deletion completed!")
-    print(f"   Total rows deleted: {total_deleted:,}")
-    print(f"   Log file: {log_file}")
+def drop_databases(target_conn, databases: List[Dict]):
+    """Drop the databases."""
+    print("\nDropping databases...")
 
+    dropped = 0
+    failed = []
 
-def get_user_input() -> tuple:
-    """Get databases and customer IDs from user."""
-    print("\n📋 Deletion Configuration:")
-    
-    # Get source connection to list databases
-    source_conn = pymysql.connect(**READ_CONFIG)
-    
-    try:
-        databases = get_all_databases(source_conn)
-        
-        print("\n📁 Available Databases:")
-        for idx, db in enumerate(databases, 1):
-            print(f"   {idx}. {db}")
-        
-        print("\nEnter database names (comma-separated) or 'all':")
-        db_input = input("> ").strip()
-        
-        if db_input.lower() == 'all':
-            selected_databases = databases
-        else:
-            selected_databases = [db.strip() for db in db_input.split(',')]
-        
-        # Get customer IDs
-        print("\n🎯 Filter by Customer IDs?")
-        print("   Enter customer IDs (comma-separated) or 'none' to delete ALL data:")
-        customer_input = input("> ").strip()
-        
-        if customer_input.lower() == 'none':
-            print("\n⚠️  WARNING: No customer_id filter! This will delete ALL data from tables!")
-            customer_ids = None
-        else:
-            # Parse customer IDs
-            customer_input = customer_input.strip('[]')
-            customer_ids = [int(x.strip()) for x in customer_input.split(',')]
-        
-        return selected_databases, customer_ids
-    
-    finally:
-        source_conn.close()
+    for db in databases:
+        db_name = db['name']
+        print(f"  DROP DATABASE `{db_name}`...", end='', flush=True)
+
+        try:
+            with target_conn.cursor() as cursor:
+                cursor.execute(f"DROP DATABASE `{db_name}`")
+                target_conn.commit()
+            print(" Done")
+            dropped += 1
+        except Exception as e:
+            print(f" Error: {e}")
+            failed.append(db_name)
+
+    print(f"\nCompleted: {dropped} dropped, {len(failed)} failed")
+    if failed:
+        print(f"Failed: {', '.join(failed)}")
 
 
 def main():
-    """Main function."""
     parser = argparse.ArgumentParser(
-        description='Delete Migrated Data from Target Database',
+        description='Drop migrated databases from target server',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
-⚠️  WARNING: This script DELETES data!
-
 Examples:
-  # Preview what would be deleted (safe)
-  python delete_migrated_data.py --dry-run
-  
-  # Delete with backup (recommended)
-  python delete_migrated_data.py --backup
-  
-  # Delete without backup (dangerous)
-  python delete_migrated_data.py
-  
-  # Delete specific tables only
-  python delete_migrated_data.py --tables users,orders
+  python delete_migrated_data.py --dry-run              # Preview only
+  python delete_migrated_data.py --databases STARFOX    # Drop specific DB
+  python delete_migrated_data.py --all --backup         # Drop all with backup
         '''
     )
-    
+
     parser.add_argument('--dry-run', action='store_true',
-                       help='Preview deletion plan without executing')
+                       help='Preview what would be dropped (no changes)')
     parser.add_argument('--backup', action='store_true',
-                       help='Create backup before deletion (recommended)')
-    parser.add_argument('--tables', type=str,
-                       help='Comma-separated list of tables to delete')
+                       help='Create backup before dropping')
     parser.add_argument('--databases', type=str,
-                       help='Comma-separated list of databases (overrides interactive input)')
-    parser.add_argument('--customer-ids', type=str,
-                       help='Comma-separated customer IDs to filter')
-    parser.add_argument('--no-confirmation', action='store_true',
-                       help='Skip confirmation prompts (VERY DANGEROUS!)')
-    
+                       help='Comma-separated list of databases to drop')
+    parser.add_argument('--all', action='store_true',
+                       help='Drop all databases that exist in source')
+    parser.add_argument('--no-confirm', action='store_true',
+                       help='Skip confirmation (DANGEROUS)')
+
     args = parser.parse_args()
-    
-    print("\n🗑️  Delete Migrated Data Script")
-    print("="*80)
-    print("⚠️  WARNING: This will DELETE data from the TARGET database!")
-    print(f"   Target: {WRITE_CONFIG['host']}:{WRITE_CONFIG['port']}")
-    print("="*80)
-    
-    # Validate config
+
+    print("\n" + "="*70)
+    print("DATABASE CLEANUP SCRIPT")
+    print("="*70)
+    print(f"Source: {READ_CONFIG['host']}:{READ_CONFIG['port']}")
+    print(f"Target: {WRITE_CONFIG['host']}:{WRITE_CONFIG['port']} (databases will be DROPPED here)")
+    print("="*70)
+
     validate_config()
-    
-    # Get databases and customer IDs
-    if args.databases and args.customer_ids:
-        # Both provided via command-line
+
+    # Determine which databases to drop
+    if args.databases:
         databases = [db.strip() for db in args.databases.split(',')]
-        customer_ids = [int(x.strip()) for x in args.customer_ids.split(',')]
-    elif args.databases:
-        # Only databases via command-line, get customer IDs interactively
-        databases = [db.strip() for db in args.databases.split(',')]
-        print("\n🎯 Filter by Customer IDs?")
-        print("   Enter customer IDs (comma-separated) or 'none' to delete ALL data:")
-        customer_input = input("> ").strip()
-        
-        if customer_input.lower() == 'none':
-            print("\n⚠️  WARNING: No customer_id filter! This will delete ALL data from tables!")
-            customer_ids = None
-        else:
-            customer_input = customer_input.strip('[]')
-            customer_ids = [int(x.strip()) for x in customer_input.split(',')]
+    elif args.all:
+        databases = []  # Empty means all matching
     else:
-        # Get both interactively
-        databases, customer_ids = get_user_input()
-    
-    # Get specific tables if provided
-    specific_tables = [t.strip() for t in args.tables.split(',')] if args.tables else None
-    
-    # Connect to databases
+        # Interactive mode
+        source_conn = pymysql.connect(**READ_CONFIG)
+        try:
+            available = get_databases(source_conn)
+            print("\nDatabases in source:")
+            for idx, db in enumerate(available, 1):
+                print(f"  {idx}. {db}")
+
+            print("\nEnter database names (comma-separated) or 'all':")
+            user_input = input("> ").strip()
+
+            if user_input.lower() == 'all':
+                databases = []
+            else:
+                databases = [db.strip() for db in user_input.split(',')]
+        finally:
+            source_conn.close()
+
+    # Connect and analyze
     source_conn = pymysql.connect(**READ_CONFIG)
     target_conn = pymysql.connect(**WRITE_CONFIG)
-    
+
     try:
-        # Analyze deletion scope
-        print("\n🔍 Analyzing deletion scope...")
-        analysis = analyze_deletion_scope(source_conn, target_conn, databases, 
-                                         customer_ids, specific_tables)
-        
-        if analysis['total_rows'] == 0:
-            print("\n✅ No data to delete (tables are empty or don't exist in target).")
+        print("\nAnalyzing...")
+        analysis = analyze_drop_scope(source_conn, target_conn, databases)
+
+        if analysis['total_databases'] == 0:
+            print("\nNo databases to drop.")
+            if databases:
+                print(f"Requested databases not found in both source and target.")
             return
-        
+
         # Dry run
         if args.dry_run:
-            show_deletion_plan(analysis)
-            print("\n✅ DRY-RUN completed. No data was deleted.")
-            print("   Remove --dry-run flag to execute deletion.")
+            show_drop_plan(analysis)
+            print("\nDRY-RUN: No databases were dropped.")
+            print("Remove --dry-run to execute.")
             return
-        
+
         # Get confirmation
-        if not args.no_confirmation:
-            if not get_deletion_confirmation(analysis):
+        if not args.no_confirm:
+            if not get_confirmation(analysis):
                 return
-        
-        # Backup
+
+        # Backup if requested
         if args.backup:
-            backup_before_deletion(databases)
-        
-        # Execute deletion
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        log_file = f"deletion_log_{timestamp}.json"
-        
-        execute_deletion(target_conn, analysis, log_file)
-        
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-    
+            db_names = [d['name'] for d in analysis['databases']]
+            backup_databases(db_names)
+
+        # Execute drop
+        drop_databases(target_conn, analysis['databases'])
+
+        print("\nCleanup completed!")
+
     finally:
         source_conn.close()
         target_conn.close()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nCancelled by user.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\nError: {e}")
+        sys.exit(1)

@@ -2,12 +2,13 @@
 
 ## Overview
 
-This repository contains two complementary MariaDB migration scripts:
+This repository contains three MariaDB migration scripts:
 
 | Script | Purpose |
 |--------|---------|
 | `migrate_databases.py` | **Schema Migration** - Migrates database structure (tables, indexes, foreign keys) |
 | `migrate_customer_data_v3.py` | **Data Migration** - Migrates customer-specific data with intelligent filtering |
+| `delete_migrated_data.py` | **Cleanup** - Drops migrated databases from target server |
 
 ---
 
@@ -26,6 +27,9 @@ python migrate_databases.py
 
 # 4. Run data migration
 python migrate_customer_data_v3.py --databases STARFOX --customer-ids 1,2,3
+
+# 5. (Optional) Cleanup - drop databases from target
+python delete_migrated_data.py --databases STARFOX --dry-run
 ```
 
 ---
@@ -54,6 +58,9 @@ python migrate_customer_data_v3.py --databases STARFOX --customer-ids 1,2,3
 │   ├── Phase 1B: Tables with user_id (filtered)                      │
 │   ├── Phase 1C: Tables with indirect FK (filtered via JOIN)         │
 │   └── Phase 2: Reference tables (all data)                          │
+│                                                                      │
+│   CLEANUP: delete_migrated_data.py                                   │
+│   └── DROP DATABASE for each migrated database                       │
 │                                                                      │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -261,6 +268,90 @@ python migrate_customer_data_v3.py --force-tables "STARFOX.ACCESS_RIGHT" --datab
 
 ---
 
+## Script 3: delete_migrated_data.py (Cleanup)
+
+### What It Does
+
+Drops databases from TARGET that exist in SOURCE. Used for:
+- Reverting a migration
+- Cleaning up test environments
+- Starting fresh
+
+### Usage
+
+```bash
+# Preview what would be dropped (safe - no changes made)
+python delete_migrated_data.py --dry-run
+
+# Drop specific databases
+python delete_migrated_data.py --databases STARFOX,ONBOARDING
+
+# Drop all matching databases (with backup)
+python delete_migrated_data.py --all --backup
+
+# Interactive mode
+python delete_migrated_data.py
+```
+
+### CLI Arguments Reference
+
+| Argument | Description | Example |
+|----------|-------------|---------|
+| `--dry-run` | Preview only, no changes | `--dry-run` |
+| `--databases` | Specific databases to drop | `--databases STARFOX,ONBOARDING` |
+| `--all` | Drop all matching databases | `--all` |
+| `--backup` | Create backup before dropping | `--backup` |
+| `--no-confirm` | Skip confirmation (DANGEROUS) | `--no-confirm` |
+
+### Example Output
+
+```
+======================================================================
+DATABASE CLEANUP SCRIPT
+======================================================================
+Source: prod-db.example.com:3306
+Target: dev-db.example.com:3306 (databases will be DROPPED here)
+======================================================================
+
+Analyzing...
+
+======================================================================
+DROP PLAN REVIEW
+======================================================================
+
+Target: dev-db.example.com:3306
+
+The following databases will be DROPPED:
+
+Database                       Tables     Size (MB)
+-------------------------------------------------------
+STARFOX                        45         125.50
+ONBOARDING                     32         89.20
+-------------------------------------------------------
+TOTAL                          77         214.70
+======================================================================
+
+Step 1/2: Type 'yes' to continue: yes
+Step 2/2: Type 'DROP DATABASES' to confirm: DROP DATABASES
+
+Dropping databases...
+  DROP DATABASE `STARFOX`... Done
+  DROP DATABASE `ONBOARDING`... Done
+
+Completed: 2 dropped, 0 failed
+
+Cleanup completed!
+```
+
+### Safety Features
+
+1. **Two-step confirmation** - Must type 'yes' then 'DROP DATABASES'
+2. **Dry-run mode** - Preview without making changes
+3. **Optional backup** - mysqldump before dropping
+4. **Shows size/table count** - Know what you're deleting
+
+---
+
 ## State File System (V3 Feature)
 
 ### Location
@@ -369,7 +460,7 @@ SKIP_TABLES=STARFOX.AUDIT_LOG,*.temp_data,LOGS.*
 ```
 Problem without disabling:
   INSERT INTO ROLE_USER (role_id=1, user_id=1)
-  ❌ Error: Cannot add or update a child row - FK constraint fails
+  Error: Cannot add or update a child row - FK constraint fails
   (because ROLE with id=1 hasn't been inserted yet)
 
 Solution with FK checks disabled:
@@ -430,17 +521,30 @@ python migrate_customer_data_v3.py \
   --customer-ids 1,2,3
 ```
 
-### Example 5: Skip Large Reference Tables
+### Example 5: Complete Cleanup and Start Fresh
 
 ```bash
-# Set environment to auto-skip large tables
-export SKIP_LARGE_TABLES=true
-export AUTO_CONFIRM_THRESHOLD=100
+# 1. Preview what will be dropped
+python delete_migrated_data.py --dry-run
 
+# 2. Drop with backup (recommended)
+python delete_migrated_data.py --all --backup
+
+# 3. Clear state files
+rm -rf .migration_state/
+
+# 4. Re-run migration from scratch
+python migrate_databases.py
 python migrate_customer_data_v3.py --databases STARFOX --customer-ids 1,2,3
+```
 
-# Tables > 100 rows without customer_id are auto-skipped
-# They'll be prompted on next run with --force-tables
+### Example 6: Drop Specific Database Only
+
+```bash
+# Drop only STARFOX, keep other databases
+python delete_migrated_data.py --databases STARFOX
+
+# Type 'yes' then 'DROP DATABASES' to confirm
 ```
 
 ---
@@ -491,13 +595,13 @@ conn.close()
 3. **FK Checks Toggle**: Prevents constraint violations during migration
 4. **Confirmation Prompts**: Large tables require explicit approval
 5. **Graceful Abort**: Ctrl+C saves state and exits cleanly
+6. **Cleanup Dry-Run**: Preview database drops before executing
 
 ### What's NOT Automatic
 
-- ❌ Rollback on failure (use `delete_migrated_data.py` separately)
-- ❌ Schema changes (run `migrate_databases.py` for that)
-- ❌ Cross-database foreign keys
-- ❌ Triggers and events (only procedures/functions are migrated)
+- Schema changes (run `migrate_databases.py` for structure)
+- Cross-database foreign keys
+- Triggers and events (only procedures/functions are migrated)
 
 ---
 
@@ -522,17 +626,25 @@ conn.close()
 2. **Test foreign keys** - Ensure relationships are intact
 3. **Check procedures** - Verify stored procedures work
 
+### For Cleanup
+
+1. **Always use --dry-run first** - Preview before dropping
+2. **Use --backup for important data** - Creates mysqldump before drop
+3. **Double-check target server** - Ensure you're dropping from correct server
+
 ---
 
 ## File Reference
 
 | File | Purpose |
 |------|---------|
-| `migrate_databases.py` | Schema migration script |
-| `migrate_customer_data_v3.py` | Data migration script (V3) |
-| `delete_migrated_data.py` | Cleanup/rollback script |
-| `.env` | Environment configuration |
-| `.migration_state/` | State tracking directory |
+| `migrate_databases.py` | Schema migration (tables, indexes, FKs) |
+| `migrate_customer_data_v3.py` | Data migration with customer filtering |
+| `delete_migrated_data.py` | Drop databases from target server |
+| `.env.example` | Environment configuration template |
+| `.env` | Your environment configuration (create from .env.example) |
+| `.migration_state/` | State tracking directory (auto-created) |
+| `requirements.txt` | Python dependencies |
 | `PROD_README.md` | This documentation |
 
 ---
@@ -543,13 +655,4 @@ conn.close()
 |---------|----------|
 | V1 | Basic customer_id filtering |
 | V2 | Force-migrate tables, implicit FK detection |
-| V3 | State tracking, SKIP_TABLES, stored procedures, CLI flags |
-
----
-
-## Support
-
-For issues or questions:
-1. Check the troubleshooting section above
-2. Review the state file for migration status
-3. Check database connection with debug commands
+| V3 | State tracking, SKIP_TABLES, stored procedures, CLI flags, cleanup script |
